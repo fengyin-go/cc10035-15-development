@@ -69,6 +69,24 @@ npm run dev
 | 抽取工坊 | `extract_studio` | 交互任务 | 任务名称、示例页面、标注区域 |
 | 聚合视图 | `aggregate_view` | 视图配置 | 视图名称、统计维度、聚合字段 |
 
+## 正文证据与模板资格
+
+内容分类不再按 URI 直接给标签，而是校验采集到的页面正文，按证据门槛生成
+“模板候选依据数据集”，再由模板规则消费：
+
+1. `POST /api/evidence/datasets`：校验正文并给出各类别证据得分、门槛结论与候选 ID。
+   正文缺失、正文不足或低于门槛时 `qualified=false`，不能进入可采集模板集合。
+2. `POST /api/evidence/trials`：只对通过门槛的候选生成字段试跑样本（含正文出处片段），
+   同一页面命中多个类别时按“得分 → 字段覆盖率 → 字段数 → 类别优先级”裁定，
+   裁定理由写进试跑回执，并回写分类审核清单、草稿模板、页面快照和文本分块。
+3. `GET /api/evidence/trials/{receipt_id}`：按回执回查，含当期未采纳证据的正文片段。
+4. `GET /api/evidence/dataset?page_uri=`：按页面列出各正文版本与门槛口径的判定，
+   规则调整后重算只追加新版本，旧样本判定依据只读保留。
+5. `GET /api/evidence/collectable`：可采集模板集合，缺正文或低于门槛的一律不在其中。
+
+门槛口径定义在 `backend/app/services/evidence_rules.py`（`gate-2026.11-v1`、
+`gate-2026.11-v2`）。验收脚本：`cd backend && .venv/bin/python -m app.verify_evidence`。
+
 ## 约定
 
 - 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。

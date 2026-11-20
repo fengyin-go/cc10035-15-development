@@ -22,6 +22,8 @@
       </article>
     </div>
 
+    <EvidencePanel v-if="showEvidence" />
+
     <p class="status-legend">
       <span v-for="item in statusSummary" :key="item.status" class="legend-item">
         {{ item.status }}：{{ item.count }}
@@ -103,10 +105,13 @@ import {
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
+import EvidencePanel from '@/views/EvidencePanel.vue'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
+// 内容分类负责产出候选依据，模板规则负责消费并试跑，两个模块共用同一块正文证据面板。
+const showEvidence = computed(() => ['content_classifier', 'template_rule'].includes(meta.key))
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
+from app.services import evidence_rules
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -22,44 +23,62 @@ class ContentClassifierService(BaseModuleService):
     MODULE = "content_classifier"
     ENTITY = "分类标签"
     OPERATION_TERM = "采集"
-    LIST_FIELDS = ["标签ID", "页面URI", "一级分类", "二级分类", "置信度", "分类依据", "标注时间"]
+    LIST_FIELDS = [
+        "标签ID", "页面URI", "一级分类", "二级分类", "置信度", "分类依据", "标注时间",
+        "正文版本", "正文哈希", "正文状态", "门槛口径", "模板候选ID", "采纳模板",
+        "试跑结果", "试跑回执ID",
+    ]
     REQUIRED_FIELDS = ["标签ID", "页面URI", "一级分类"]
     STATUS_ORDER = ["待分类", "已分类", "已复核", "已订正"]
     ACTION_RULES = {"提交分类": "待分类", "复核标签": "已分类", "订正分类": "已分类"}
     NEGATIVE_ACTIONS = []
 
-    def classify_page(self, page_uri: str, page_content: str = "") -> dict[str, Any]:
-        """对单个页面进行内容分类。消费DOM解析的页面URI。"""
-        uri_hash = int(hashlib.md5(page_uri.encode()).hexdigest()[:4], 16)
-        categories = list(CATEGORY_HIERARCHY.keys())
-        cat_idx = uri_hash % len(categories)
-        primary = categories[cat_idx]
-        secondary_options = CATEGORY_HIERARCHY[primary]
-        sec_idx = (uri_hash // 10) % len(secondary_options)
-        secondary = secondary_options[sec_idx]
+    def classify_page(
+        self, page_uri: str, page_content: str = "", profile_id: str | None = None
+    ) -> dict[str, Any]:
+        """对单个页面进行内容分类：有正文时按正文证据标注，无正文时明确未分类。
+
+        页面 URI 只用于生成标签标识；分类本身不再由 URI 哈希决定。
+        """
+        try:
+            profile = evidence_rules.get_profile(profile_id)
+        except KeyError as exc:
+            return {"ok": False, "reason": str(exc)}
+        evaluation = evidence_rules.evaluate_body(page_content, profile["profile_id"])
+        classification = evidence_rules.classify(evaluation, page_content)
         tag_id = hashlib.sha256(page_uri.encode()).hexdigest()[:12]
-        confidence = round(0.75 + (uri_hash % 200) / 1000.0, 2)
-
-        extras = {
-            "电子商务": "商品标题、价格结构和商详HTML特征",
-            "新闻媒体": "article标签、日期元数据和作者署名模式",
-            "企业官网": "公司简介、联系方式和服务介绍结构",
-            "技术资讯": "代码块、技术关键词和目录导航",
-            "政府网站": "gov域名、公告格式和法规引用",
-            "教育学术": "参考文献、摘要结构和学术关键词",
-        }
-        basis = extras.get(primary, "通用页面结构分析")
-
         return {
             "ok": True,
             "标签ID": tag_id,
             "页面URI": page_uri,
-            "一级分类": primary,
-            "二级分类": secondary,
-            "置信度": str(confidence),
-            "分类依据": basis,
+            "一级分类": classification["primary_category"],
+            "二级分类": classification["secondary_category"],
+            "置信度": f"{classification['confidence']:.2f}",
+            "分类依据": classification["basis"],
             "标注时间": "2026-11-19T10:00:00Z",
+            "正文状态": classification["body_status"],
+            "门槛口径": profile["profile_id"],
+            "达标类别": classification["qualified_categories"],
+            "候选详情": [
+                {
+                    "category": item["category"],
+                    "evidence_score": item["evidence_score"],
+                    "threshold": item["threshold"],
+                    "gate": item["gate"],
+                    "gate_reason": item["gate_reason"],
+                }
+                for item in evaluation["candidates"]
+            ],
         }
+
+    def build_template_candidates(
+        self, page_uri: str, page_content: str, *, profile_id: str | None = None
+    ) -> dict[str, Any]:
+        """消费正文证据并生成模板候选依据数据集，交模板规则模块使用。"""
+        from app.services.template_rule import TemplateRuleService
+
+        return TemplateRuleService().build_candidate_dataset(
+            page_uri, page_content, source="content_classifier", profile_id=profile_id)
 
     def feed_extract_metric(self) -> dict[str, Any]:
         """将分类结果提供给抽取指标进行效率分析。"""
@@ -75,19 +94,35 @@ class ContentClassifierService(BaseModuleService):
         }
 
     def feed_template_rules(self) -> dict[str, Any]:
-        """按分类推荐合适的模板规则。"""
+        """按分类审核清单里的采纳结果推荐模板，不再按 URI 标签硬匹配站点。
+
+        只有试跑已采纳（正文通过证据门槛）的记录才会带出模板，
+        缺正文或低于门槛的记录会出现在 blocked 里供复核。
+        """
         rows = store.rows(self.MODULE)
-        template_rows = store.rows("template_rule")
-        recommendations: dict[str, list[str]] = {}
-        for cat in CATEGORY_HIERARCHY.keys():
-            recommendations[cat] = [
-                t.get("模板名称") for t in template_rows
-                if t.get("适用站点") and cat[:2] in str(t.get("适用站点", ""))
-            ]
+        recommendations: dict[str, list[dict[str, Any]]] = {}
+        blocked: list[dict[str, Any]] = []
+        for row in rows:
+            category = row.get("一级分类", "未分类")
+            if row.get("采纳模板") in (None, "", "—"):
+                blocked.append({
+                    "page_uri": row.get("页面URI"),
+                    "category": category,
+                    "reason": row.get("试跑结果") or row.get("正文状态") or "尚未试跑",
+                })
+                continue
+            recommendations.setdefault(category, []).append({
+                "template_name": row.get("采纳模板"),
+                "page_uri": row.get("页面URI"),
+                "body_hash": row.get("正文哈希"),
+                "profile_id": row.get("门槛口径"),
+                "receipt_id": row.get("试跑回执ID"),
+            })
         return {
             "ok": True,
             "classified_pages": len(rows),
             "template_recommendations": recommendations,
+            "blocked": blocked,
         }
 
     def compute_classification_stats(self) -> dict[str, Any]:
